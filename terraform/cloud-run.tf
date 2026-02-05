@@ -42,10 +42,7 @@ resource "google_cloud_run_v2_service" "openclaw" {
       }
 
       # Environment variables
-      env {
-        name  = "PORT"
-        value = "8080"
-      }
+      # Note: PORT is automatically set by Cloud Run to the container_port value
 
       env {
         name  = "GCS_BUCKET"
