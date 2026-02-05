@@ -89,8 +89,14 @@ background_sync() {
 # Graceful shutdown handler
 shutdown_handler() {
     log "Received shutdown signal, performing final sync..."
+    
+    # Kill the background sync process first
+    if [ -n "$SYNC_PID" ]; then
+        kill "$SYNC_PID" 2>/dev/null || true
+    fi
+    
     sync_to_gcs
-    log "Final sync completed, exiting"
+    log "Final sync completed"
     
     # Kill the gateway process
     if [ -n "$GATEWAY_PID" ]; then
@@ -98,6 +104,7 @@ shutdown_handler() {
         wait "$GATEWAY_PID" 2>/dev/null || true
     fi
     
+    log "Shutdown complete, exiting"
     exit 0
 }
 
@@ -131,12 +138,32 @@ case "${1:-gateway}" in
         export HOME="${HOME:-/home/node}"
         export OPENCLAW_GATEWAY_BIND="$GATEWAY_BIND"
         
-        # Run the gateway with the Cloud Run port
-        exec node /app/dist/index.js gateway \
+        # Run the gateway in background (not exec) so trap handlers remain active.
+        # Using exec would replace the shell, discarding trap handlers and preventing
+        # graceful shutdown with final GCS sync.
+        node /app/dist/index.js gateway \
             --allow-unconfigured \
             --bind "$GATEWAY_BIND" \
             --port "$PORT" \
-            "$@"
+            "$@" &
+        GATEWAY_PID=$!
+        
+        log "Gateway started with PID $GATEWAY_PID"
+        
+        # Wait for the gateway process. This keeps the shell alive so trap handlers
+        # can intercept SIGTERM/SIGINT and run shutdown_handler for final sync.
+        # If gateway exits on its own, we propagate its exit code.
+        wait "$GATEWAY_PID"
+        GATEWAY_EXIT_CODE=$?
+        
+        # Gateway exited without signal (natural exit or crash)
+        log "Gateway exited with code $GATEWAY_EXIT_CODE"
+        
+        # Perform final sync and cleanup
+        kill "$SYNC_PID" 2>/dev/null || true
+        sync_to_gcs
+        
+        exit "$GATEWAY_EXIT_CODE"
         ;;
     
     shell)
