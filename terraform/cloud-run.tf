@@ -74,6 +74,12 @@ resource "google_cloud_run_v2_service" "openclaw" {
         value = "production"
       }
 
+      # Node.js memory configuration (set heap to ~75% of container memory)
+      env {
+        name  = "NODE_OPTIONS"
+        value = "--max-old-space-size=1536"
+      }
+
       # Secrets from Secret Manager
       env {
         name = "ANTHROPIC_API_KEY"
