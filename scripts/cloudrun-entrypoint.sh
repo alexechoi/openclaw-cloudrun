@@ -114,8 +114,52 @@ trap shutdown_handler SIGTERM SIGINT
 # Create directories
 mkdir -p "$OPENCLAW_STATE_DIR" "$OPENCLAW_WORKSPACE_DIR"
 
+# Ensure gateway config exists with headless-friendly defaults.
+# allowInsecureAuth lets token-only auth bypass device pairing, which is
+# required for Cloud Run where there's no interactive pairing flow.
+ensure_gateway_config() {
+    local config_file="$OPENCLAW_STATE_DIR/openclaw.json"
+
+    if [ ! -f "$config_file" ]; then
+        log "Creating default gateway config at $config_file"
+        cat > "$config_file" <<'CFGEOF'
+{
+  "gateway": {
+    "mode": "local",
+    "controlUi": {
+      "allowInsecureAuth": true
+    }
+  }
+}
+CFGEOF
+    else
+        # Config exists (possibly restored from GCS). Ensure allowInsecureAuth
+        # is set so token-only auth works without device pairing.
+        if command -v node >/dev/null 2>&1; then
+            node -e "
+const fs = require('fs');
+const f = '$config_file';
+const c = JSON.parse(fs.readFileSync(f, 'utf8'));
+if (!c.gateway) c.gateway = {};
+if (!c.gateway.controlUi) c.gateway.controlUi = {};
+if (c.gateway.controlUi.allowInsecureAuth !== true) {
+  c.gateway.controlUi.allowInsecureAuth = true;
+  fs.writeFileSync(f, JSON.stringify(c, null, 2) + '\n');
+  console.log('[entrypoint] Patched allowInsecureAuth into existing config');
+}
+"
+        else
+            log "WARN: node not found, cannot patch existing config"
+        fi
+    fi
+}
+
 # Restore from GCS on startup
 restore_from_gcs
+
+# Ensure gateway config has headless auth settings (after restore, so we
+# can patch a restored config if needed)
+ensure_gateway_config
 
 # Start background sync
 background_sync &
