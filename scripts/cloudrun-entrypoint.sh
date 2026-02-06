@@ -141,11 +141,12 @@ case "${1:-gateway}" in
         # Run the gateway in background (not exec) so trap handlers remain active.
         # Using exec would replace the shell, discarding trap handlers and preventing
         # graceful shutdown with final GCS sync.
+        # Note: We use ${@:2} to skip the first argument ("gateway") which was already matched
         node /app/dist/index.js gateway \
             --allow-unconfigured \
             --bind "$GATEWAY_BIND" \
             --port "$PORT" \
-            "$@" &
+            "${@:2}" &
         GATEWAY_PID=$!
         
         log "Gateway started with PID $GATEWAY_PID"
