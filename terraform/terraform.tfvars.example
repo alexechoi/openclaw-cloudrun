@@ -1,0 +1,81 @@
+# OpenClaw Cloud Run - Example Terraform Variables
+# 
+# Copy this file to terraform.tfvars and fill in your values:
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# IMPORTANT: Never commit terraform.tfvars to git (it may contain secrets)
+
+# Required: Your GCP project ID
+project_id = "my-gcp-project"
+
+# Optional: GCP region (default: us-central1)
+region = "us-central1"
+
+# Optional: Environment name for labeling
+environment = "prod"
+
+# =============================================================================
+# Cloud Run Configuration
+# =============================================================================
+
+# CPU allocation (1, 2, or 4)
+cloud_run_cpu = "1"
+
+# Memory allocation
+cloud_run_memory = "1Gi"
+
+# Minimum instances (0 = scale to zero, 1+ = always on)
+# Recommended: 1 for personal use (avoids cold starts)
+cloud_run_min_instances = 1
+
+# Maximum instances
+cloud_run_max_instances = 1
+
+# Request timeout in seconds (max 3600)
+cloud_run_timeout = 300
+
+# =============================================================================
+# Authentication
+# =============================================================================
+
+# Allow unauthenticated access?
+# - true: Anyone with the gateway token can access
+# - false: Requires Google authentication (IAP or allAuthenticatedUsers)
+allow_unauthenticated = false
+
+# Enable Identity-Aware Proxy?
+# Requires additional setup - see terraform/iap.tf for instructions
+iap_enabled = false
+
+# Members allowed through IAP (only if iap_enabled = true)
+# iap_allowed_members = [
+#   "user:alice@example.com",
+#   "user:bob@example.com",
+#   "group:team@example.com",
+# ]
+
+# =============================================================================
+# Cloud Build (Optional CI/CD)
+# =============================================================================
+
+# Enable Cloud Build trigger?
+cloud_build_enabled = false
+
+# GitHub repository owner (required if cloud_build_enabled = true)
+# github_repo_owner = "your-github-username"
+
+# GitHub repository name
+# github_repo_name = "openclaw"
+
+# Branch to trigger builds on
+# github_branch = "main"
+
+# =============================================================================
+# Gateway Configuration
+# =============================================================================
+
+# Gateway bind mode
+gateway_bind = "lan"
+
+# Gateway port (inside container)
+gateway_port = 18789
