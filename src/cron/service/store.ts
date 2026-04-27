@@ -1,120 +1,23 @@
 import fs from "node:fs";
-import type { CronJob } from "../types.js";
-import type { CronServiceState } from "./state.js";
-import { parseAbsoluteTimeMs } from "../parse.js";
-import { migrateLegacyCronPayload } from "../payload-migration.js";
+import { normalizeCronJobIdentityFields } from "../normalize-job-identity.js";
+import { normalizeCronJobInput } from "../normalize.js";
+import { cronSchedulingInputsEqual } from "../schedule-identity.js";
+import { isInvalidCronSessionTargetIdError } from "../session-target.js";
 import { loadCronStore, saveCronStore } from "../store.js";
+import type { CronJob } from "../types.js";
 import { recomputeNextRuns } from "./jobs.js";
-import { inferLegacyName, normalizeOptionalText } from "./normalize.js";
+import type { CronServiceState } from "./state.js";
 
-function hasLegacyDeliveryHints(payload: Record<string, unknown>) {
-  if (typeof payload.deliver === "boolean") {
-    return true;
+function invalidateStaleNextRunOnScheduleChange(params: {
+  previousJobsById: ReadonlyMap<string, CronJob>;
+  hydrated: CronJob;
+}) {
+  const previousJob = params.previousJobsById.get(params.hydrated.id);
+  if (!previousJob || cronSchedulingInputsEqual(previousJob, params.hydrated)) {
+    return;
   }
-  if (typeof payload.bestEffortDeliver === "boolean") {
-    return true;
-  }
-  if (typeof payload.to === "string" && payload.to.trim()) {
-    return true;
-  }
-  return false;
-}
-
-function buildDeliveryFromLegacyPayload(payload: Record<string, unknown>) {
-  const deliver = payload.deliver;
-  const mode = deliver === false ? "none" : "announce";
-  const channelRaw =
-    typeof payload.channel === "string" ? payload.channel.trim().toLowerCase() : "";
-  const toRaw = typeof payload.to === "string" ? payload.to.trim() : "";
-  const next: Record<string, unknown> = { mode };
-  if (channelRaw) {
-    next.channel = channelRaw;
-  }
-  if (toRaw) {
-    next.to = toRaw;
-  }
-  if (typeof payload.bestEffortDeliver === "boolean") {
-    next.bestEffort = payload.bestEffortDeliver;
-  }
-  return next;
-}
-
-function buildDeliveryPatchFromLegacyPayload(payload: Record<string, unknown>) {
-  const deliver = payload.deliver;
-  const channelRaw =
-    typeof payload.channel === "string" ? payload.channel.trim().toLowerCase() : "";
-  const toRaw = typeof payload.to === "string" ? payload.to.trim() : "";
-  const next: Record<string, unknown> = {};
-  let hasPatch = false;
-
-  if (deliver === false) {
-    next.mode = "none";
-    hasPatch = true;
-  } else if (deliver === true || toRaw) {
-    next.mode = "announce";
-    hasPatch = true;
-  }
-  if (channelRaw) {
-    next.channel = channelRaw;
-    hasPatch = true;
-  }
-  if (toRaw) {
-    next.to = toRaw;
-    hasPatch = true;
-  }
-  if (typeof payload.bestEffortDeliver === "boolean") {
-    next.bestEffort = payload.bestEffortDeliver;
-    hasPatch = true;
-  }
-
-  return hasPatch ? next : null;
-}
-
-function mergeLegacyDeliveryInto(
-  delivery: Record<string, unknown>,
-  payload: Record<string, unknown>,
-) {
-  const patch = buildDeliveryPatchFromLegacyPayload(payload);
-  if (!patch) {
-    return { delivery, mutated: false };
-  }
-
-  const next = { ...delivery };
-  let mutated = false;
-
-  if ("mode" in patch && patch.mode !== next.mode) {
-    next.mode = patch.mode;
-    mutated = true;
-  }
-  if ("channel" in patch && patch.channel !== next.channel) {
-    next.channel = patch.channel;
-    mutated = true;
-  }
-  if ("to" in patch && patch.to !== next.to) {
-    next.to = patch.to;
-    mutated = true;
-  }
-  if ("bestEffort" in patch && patch.bestEffort !== next.bestEffort) {
-    next.bestEffort = patch.bestEffort;
-    mutated = true;
-  }
-
-  return { delivery: next, mutated };
-}
-
-function stripLegacyDeliveryFields(payload: Record<string, unknown>) {
-  if ("deliver" in payload) {
-    delete payload.deliver;
-  }
-  if ("channel" in payload) {
-    delete payload.channel;
-  }
-  if ("to" in payload) {
-    delete payload.to;
-  }
-  if ("bestEffortDeliver" in payload) {
-    delete payload.bestEffortDeliver;
-  }
+  params.hydrated.state ??= {};
+  params.hydrated.state.nextRunAtMs = undefined;
 }
 
 async function getFileMtimeMs(path: string): Promise<number | null> {
@@ -126,140 +29,109 @@ async function getFileMtimeMs(path: string): Promise<number | null> {
   }
 }
 
-export async function ensureLoaded(state: CronServiceState, opts?: { forceReload?: boolean }) {
+export async function ensureLoaded(
+  state: CronServiceState,
+  opts?: {
+    forceReload?: boolean;
+    /** Skip recomputing nextRunAtMs after load so the caller can run due
+     *  jobs against the persisted values first (see onTimer). */
+    skipRecompute?: boolean;
+  },
+) {
   // Fast path: store is already in memory. Other callers (add, list, run, …)
   // trust the in-memory copy to avoid a stat syscall on every operation.
   if (state.store && !opts?.forceReload) {
     return;
+  }
+  const previousJobsById = new Map<string, CronJob>();
+  for (const job of state.store?.jobs ?? []) {
+    previousJobsById.set(job.id, job);
   }
   // Force reload always re-reads the file to avoid missing cross-service
   // edits on filesystems with coarse mtime resolution.
 
   const fileMtimeMs = await getFileMtimeMs(state.deps.storePath);
   const loaded = await loadCronStore(state.deps.storePath);
-  const jobs = (loaded.jobs ?? []) as unknown as Array<Record<string, unknown>>;
-  let mutated = false;
-  for (const raw of jobs) {
-    const nameRaw = raw.name;
-    if (typeof nameRaw !== "string" || nameRaw.trim().length === 0) {
-      raw.name = inferLegacyName({
-        schedule: raw.schedule as never,
-        payload: raw.payload as never,
-      });
-      mutated = true;
-    } else {
-      raw.name = nameRaw.trim();
-    }
-
-    const desc = normalizeOptionalText(raw.description);
-    if (raw.description !== desc) {
-      raw.description = desc;
-      mutated = true;
-    }
-
-    if (typeof raw.enabled !== "boolean") {
-      raw.enabled = true;
-      mutated = true;
-    }
-
-    const payload = raw.payload;
-    if (payload && typeof payload === "object" && !Array.isArray(payload)) {
-      if (migrateLegacyCronPayload(payload as Record<string, unknown>)) {
-        mutated = true;
+  const jobs = (loaded.jobs ?? []) as unknown as CronJob[];
+  for (const [index, job] of jobs.entries()) {
+    const raw = job as unknown as Record<string, unknown>;
+    const { legacyJobIdIssue } = normalizeCronJobIdentityFields(raw);
+    let normalized: Record<string, unknown> | null;
+    try {
+      normalized = normalizeCronJobInput(raw);
+    } catch (error) {
+      if (!isInvalidCronSessionTargetIdError(error)) {
+        throw error;
       }
+      normalized = null;
+      state.deps.log.warn(
+        { storePath: state.deps.storePath, jobId: typeof raw.id === "string" ? raw.id : undefined },
+        "cron: job has invalid persisted sessionTarget; run openclaw doctor --fix to repair",
+      );
     }
-
-    const schedule = raw.schedule;
-    if (schedule && typeof schedule === "object" && !Array.isArray(schedule)) {
-      const sched = schedule as Record<string, unknown>;
-      const kind = typeof sched.kind === "string" ? sched.kind.trim().toLowerCase() : "";
-      if (!kind && ("at" in sched || "atMs" in sched)) {
-        sched.kind = "at";
-        mutated = true;
-      }
-      const atRaw = typeof sched.at === "string" ? sched.at.trim() : "";
-      const atMsRaw = sched.atMs;
-      const parsedAtMs =
-        typeof atMsRaw === "number"
-          ? atMsRaw
-          : typeof atMsRaw === "string"
-            ? parseAbsoluteTimeMs(atMsRaw)
-            : atRaw
-              ? parseAbsoluteTimeMs(atRaw)
-              : null;
-      if (parsedAtMs !== null) {
-        sched.at = new Date(parsedAtMs).toISOString();
-        if ("atMs" in sched) {
-          delete sched.atMs;
-        }
-        mutated = true;
-      }
+    const hydrated =
+      normalized && typeof normalized === "object" ? (normalized as unknown as CronJob) : job;
+    jobs[index] = hydrated;
+    if (legacyJobIdIssue) {
+      const resolvedId = typeof hydrated.id === "string" ? hydrated.id : undefined;
+      state.deps.log.warn(
+        { storePath: state.deps.storePath, jobId: resolvedId },
+        "cron: job used legacy jobId field; normalized id in memory (run openclaw doctor --fix to persist canonical shape)",
+      );
     }
-
-    const delivery = raw.delivery;
-    if (delivery && typeof delivery === "object" && !Array.isArray(delivery)) {
-      const modeRaw = (delivery as { mode?: unknown }).mode;
-      if (typeof modeRaw === "string") {
-        const lowered = modeRaw.trim().toLowerCase();
-        if (lowered === "deliver") {
-          (delivery as { mode?: unknown }).mode = "announce";
-          mutated = true;
-        }
-      }
+    // Persisted legacy jobs may predate the required `enabled` field.
+    // Keep runtime behavior backward-compatible without rewriting the store.
+    if (typeof hydrated.enabled !== "boolean") {
+      hydrated.enabled = true;
     }
-
-    const isolation = raw.isolation;
-    if (isolation && typeof isolation === "object" && !Array.isArray(isolation)) {
-      delete raw.isolation;
-      mutated = true;
-    }
-
-    const payloadRecord =
-      payload && typeof payload === "object" && !Array.isArray(payload)
-        ? (payload as Record<string, unknown>)
-        : null;
-    const payloadKind =
-      payloadRecord && typeof payloadRecord.kind === "string" ? payloadRecord.kind : "";
-    const sessionTarget =
-      typeof raw.sessionTarget === "string" ? raw.sessionTarget.trim().toLowerCase() : "";
-    const isIsolatedAgentTurn =
-      sessionTarget === "isolated" || (sessionTarget === "" && payloadKind === "agentTurn");
-    const hasDelivery = delivery && typeof delivery === "object" && !Array.isArray(delivery);
-    const hasLegacyDelivery = payloadRecord ? hasLegacyDeliveryHints(payloadRecord) : false;
-
-    if (isIsolatedAgentTurn && payloadKind === "agentTurn") {
-      if (!hasDelivery) {
-        raw.delivery =
-          payloadRecord && hasLegacyDelivery
-            ? buildDeliveryFromLegacyPayload(payloadRecord)
-            : { mode: "announce" };
-        mutated = true;
+    invalidateStaleNextRunOnScheduleChange({ previousJobsById, hydrated });
+    // Same shape: persisted jobs missing `sessionTarget` crash downstream
+    // on any code path that dereferences `.startsWith` (e.g.
+    // `runIsolatedAgentJob` in `src/gateway/server-cron.ts`). Mirror the
+    // defaulter applied at create time: systemEvent payloads -> "main",
+    // agentTurn -> "isolated". Use `Object.hasOwn` rather than `in` so a
+    // poisoned prototype cannot feed a crafted `kind` into the defaulter.
+    if (typeof hydrated.sessionTarget !== "string") {
+      const payload = hydrated.payload as unknown;
+      const payloadKind =
+        payload &&
+        typeof payload === "object" &&
+        !Array.isArray(payload) &&
+        Object.hasOwn(payload, "kind")
+          ? (payload as { kind?: unknown }).kind
+          : undefined;
+      let defaulted: "main" | "isolated" | undefined;
+      if (payloadKind === "systemEvent") {
+        defaulted = "main";
+      } else if (payloadKind === "agentTurn") {
+        defaulted = "isolated";
       }
-      if (payloadRecord && hasLegacyDelivery) {
-        if (hasDelivery) {
-          const merged = mergeLegacyDeliveryInto(
-            delivery as Record<string, unknown>,
-            payloadRecord,
+      if (defaulted) {
+        hydrated.sessionTarget = defaulted;
+        // `ensureLoaded` is called with `forceReload: true` on every tick;
+        // warn once per jobId per process to avoid log spam on repeated
+        // loads of the same still-broken store file.
+        const jobId = typeof hydrated.id === "string" ? hydrated.id : undefined;
+        const dedupeKey = jobId ?? "<unknown>";
+        if (!state.warnedMissingSessionTargetJobIds.has(dedupeKey)) {
+          state.warnedMissingSessionTargetJobIds.add(dedupeKey);
+          state.deps.log.warn(
+            { storePath: state.deps.storePath, jobId, defaulted },
+            "cron: job missing sessionTarget; defaulted in memory (edit jobs.json to persist canonical shape)",
           );
-          if (merged.mutated) {
-            raw.delivery = merged.delivery;
-            mutated = true;
-          }
         }
-        stripLegacyDeliveryFields(payloadRecord);
-        mutated = true;
       }
     }
   }
-  state.store = { version: 1, jobs: jobs as unknown as CronJob[] };
+  state.store = {
+    version: 1,
+    jobs,
+  };
   state.storeLoadedAtMs = state.deps.nowMs();
   state.storeFileMtimeMs = fileMtimeMs;
 
-  // Recompute next runs after loading to ensure accuracy
-  recomputeNextRuns(state);
-
-  if (mutated) {
-    await persist(state);
+  if (!opts?.skipRecompute) {
+    recomputeNextRuns(state);
   }
 }
 
@@ -277,11 +149,11 @@ export function warnIfDisabled(state: CronServiceState, action: string) {
   );
 }
 
-export async function persist(state: CronServiceState) {
+export async function persist(state: CronServiceState, opts?: { skipBackup?: boolean }) {
   if (!state.store) {
     return;
   }
-  await saveCronStore(state.deps.storePath, state.store);
+  await saveCronStore(state.deps.storePath, state.store, opts);
   // Update file mtime after save to prevent immediate reload
   state.storeFileMtimeMs = await getFileMtimeMs(state.deps.storePath);
 }

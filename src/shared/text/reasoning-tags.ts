@@ -1,41 +1,11 @@
+import { findCodeRegions, isInsideCode } from "./code-regions.js";
 export type ReasoningTagMode = "strict" | "preserve";
 export type ReasoningTagTrim = "none" | "start" | "both";
 
-const QUICK_TAG_RE = /<\s*\/?\s*(?:think(?:ing)?|thought|antthinking|final)\b/i;
+const QUICK_TAG_RE = /<\s*\/?\s*(?:(?:antml:)?(?:think(?:ing)?|thought)|antthinking|final)\b/i;
 const FINAL_TAG_RE = /<\s*\/?\s*final\b[^<>]*>/gi;
-const THINKING_TAG_RE = /<\s*(\/?)\s*(?:think(?:ing)?|thought|antthinking)\b[^<>]*>/gi;
-
-interface CodeRegion {
-  start: number;
-  end: number;
-}
-
-function findCodeRegions(text: string): CodeRegion[] {
-  const regions: CodeRegion[] = [];
-
-  const fencedRe = /(^|\n)(```|~~~)[^\n]*\n[\s\S]*?(?:\n\2(?:\n|$)|$)/g;
-  for (const match of text.matchAll(fencedRe)) {
-    const start = (match.index ?? 0) + match[1].length;
-    regions.push({ start, end: start + match[0].length - match[1].length });
-  }
-
-  const inlineRe = /`+[^`]+`+/g;
-  for (const match of text.matchAll(inlineRe)) {
-    const start = match.index ?? 0;
-    const end = start + match[0].length;
-    const insideFenced = regions.some((r) => start >= r.start && end <= r.end);
-    if (!insideFenced) {
-      regions.push({ start, end });
-    }
-  }
-
-  regions.sort((a, b) => a.start - b.start);
-  return regions;
-}
-
-function isInsideCode(pos: number, regions: CodeRegion[]): boolean {
-  return regions.some((r) => pos >= r.start && pos < r.end);
-}
+const THINKING_TAG_RE =
+  /<\s*(\/?)\s*(?:(?:antml:)?(?:think(?:ing)?|thought)|antthinking)\b[^<>]*>/gi;
 
 function applyTrim(value: string, mode: ReasoningTagTrim): string {
   if (mode === "none") {
@@ -45,6 +15,13 @@ function applyTrim(value: string, mode: ReasoningTagTrim): string {
     return value.trimStart();
   }
   return value.trim();
+}
+
+export function hasOrphanReasoningCloseBoundary(params: {
+  before: string;
+  after: string;
+}): boolean {
+  return params.before.trim().length > 0 && params.after.trim().length > 0;
 }
 
 export function stripReasoningTagsFromText(
@@ -93,7 +70,8 @@ export function stripReasoningTagsFromText(
   THINKING_TAG_RE.lastIndex = 0;
   let result = "";
   let lastIndex = 0;
-  let inThinking = false;
+  let thinkingDepth = 0;
+  let firstUnclosedContentIndex: number | undefined;
 
   for (const match of cleaned.matchAll(THINKING_TAG_RE)) {
     const idx = match.index ?? 0;
@@ -103,21 +81,48 @@ export function stripReasoningTagsFromText(
       continue;
     }
 
-    if (!inThinking) {
-      result += cleaned.slice(lastIndex, idx);
-      if (!isClose) {
-        inThinking = true;
+    if (thinkingDepth === 0) {
+      if (isClose) {
+        const afterIndex = idx + match[0].length;
+        const before = cleaned.slice(lastIndex, idx);
+        const after = cleaned.slice(afterIndex);
+        if (hasOrphanReasoningCloseBoundary({ before, after })) {
+          result = "";
+        } else {
+          result += before;
+        }
+        lastIndex = afterIndex;
+        continue;
       }
+      result += cleaned.slice(lastIndex, idx);
+      thinkingDepth = 1;
+      firstUnclosedContentIndex = idx + match[0].length;
     } else if (isClose) {
-      inThinking = false;
+      thinkingDepth -= 1;
+      if (thinkingDepth === 0) {
+        firstUnclosedContentIndex = undefined;
+      }
+    } else {
+      thinkingDepth += 1;
     }
 
     lastIndex = idx + match[0].length;
   }
 
-  if (!inThinking || mode === "preserve") {
+  if (thinkingDepth === 0 || mode === "preserve") {
     result += cleaned.slice(lastIndex);
   }
 
-  return applyTrim(result, trimMode);
+  const trimmedResult = applyTrim(result, trimMode);
+  if (
+    mode === "strict" &&
+    thinkingDepth > 0 &&
+    !trimmedResult &&
+    firstUnclosedContentIndex !== undefined &&
+    cleaned.trim()
+  ) {
+    return applyTrim(cleaned.slice(firstUnclosedContentIndex), trimMode);
+  }
+
+  return trimmedResult;
 }

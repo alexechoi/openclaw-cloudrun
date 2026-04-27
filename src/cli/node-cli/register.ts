@@ -1,12 +1,15 @@
 import type { Command } from "commander";
 import { loadNodeHostConfig } from "../../node-host/config.js";
 import { runNodeHost } from "../../node-host/runner.js";
+import { normalizeOptionalString } from "../../shared/string-coerce.js";
 import { formatDocsLink } from "../../terminal/links.js";
 import { theme } from "../../terminal/theme.js";
 import { parsePort } from "../daemon-cli/shared.js";
+import { formatHelpExamples } from "../help-format.js";
 import {
   runNodeDaemonInstall,
   runNodeDaemonRestart,
+  runNodeDaemonStart,
   runNodeDaemonStatus,
   runNodeDaemonStop,
   runNodeDaemonUninstall,
@@ -20,11 +23,20 @@ function parsePortWithFallback(value: unknown, fallback: number): number {
 export function registerNodeCli(program: Command) {
   const node = program
     .command("node")
-    .description("Run a headless node host (system.run/system.which)")
+    .description("Run and manage the headless node host service")
     .addHelpText(
       "after",
       () =>
-        `\n${theme.muted("Docs:")} ${formatDocsLink("/cli/node", "docs.openclaw.ai/cli/node")}\n`,
+        `\n${theme.heading("Examples:")}\n${formatHelpExamples([
+          [
+            "openclaw node run --host 127.0.0.1 --port 18789",
+            "Run the node host in the foreground.",
+          ],
+          ["openclaw node status", "Check node host service status."],
+          ["openclaw node install", "Install the node host service."],
+          ["openclaw node start", "Start the installed node host service."],
+          ["openclaw node restart", "Restart the installed node host service."],
+        ])}\n\n${theme.muted("Docs:")} ${formatDocsLink("/cli/node", "docs.openclaw.ai/cli/node")}\n`,
     );
 
   node
@@ -39,7 +51,9 @@ export function registerNodeCli(program: Command) {
     .action(async (opts) => {
       const existing = await loadNodeHostConfig();
       const host =
-        (opts.host as string | undefined)?.trim() || existing?.gateway?.host || "127.0.0.1";
+        normalizeOptionalString(opts.host as string | undefined) ||
+        existing?.gateway?.host ||
+        "127.0.0.1";
       const port = parsePortWithFallback(opts.port, existing?.gateway?.port ?? 18789);
       await runNodeHost({
         gatewayHost: host,
@@ -89,6 +103,14 @@ export function registerNodeCli(program: Command) {
     .option("--json", "Output JSON", false)
     .action(async (opts) => {
       await runNodeDaemonStop(opts);
+    });
+
+  node
+    .command("start")
+    .description("Start the node host service (launchd/systemd/schtasks)")
+    .option("--json", "Output JSON", false)
+    .action(async (opts) => {
+      await runNodeDaemonStart(opts);
     });
 
   node

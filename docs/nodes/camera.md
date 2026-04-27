@@ -1,12 +1,10 @@
 ---
-summary: "Camera capture (iOS node + macOS app) for agent use: photos (jpg) and short video clips (mp4)"
+summary: "Camera capture (iOS/Android nodes + macOS app) for agent use: photos (jpg) and short video clips (mp4)"
 read_when:
-  - Adding or modifying camera capture on iOS nodes or macOS
+  - Adding or modifying camera capture on iOS/Android nodes or macOS
   - Extending agent-accessible MEDIA temp-file workflows
-title: "Camera Capture"
+title: "Camera capture"
 ---
-
-# Camera capture (agent)
 
 OpenClaw supports **camera capture** for agent workflows:
 
@@ -81,7 +79,7 @@ Notes:
 
 ## Android node
 
-### User setting (default on)
+### Android user setting (default on)
 
 - Android Settings sheet → **Camera** → **Allow Camera** (`camera.enabled`)
   - Default: **on** (missing key is treated as enabled).
@@ -96,9 +94,15 @@ Notes:
 If permissions are missing, the app will prompt when possible; if denied, `camera.*` requests fail with a
 `*_PERMISSION_REQUIRED` error.
 
-### Foreground requirement
+### Android foreground requirement
 
 Like `canvas.*`, the Android node only allows `camera.*` commands in the **foreground**. Background invocations return `NODE_BACKGROUND_UNAVAILABLE`.
+
+### Android commands (via Gateway `node.invoke`)
+
+- `camera.list`
+  - Response payload:
+    - `devices`: array of `{ id, name, position, deviceType }`
 
 ### Payload guard
 
@@ -154,3 +158,9 @@ openclaw nodes screen record --node <id> --duration 10s --fps 15   # prints MEDI
 Notes:
 
 - Requires macOS **Screen Recording** permission (TCC).
+
+## Related
+
+- [Image and media support](/nodes/images)
+- [Media understanding](/nodes/media-understanding)
+- [Location command](/nodes/location-command)
