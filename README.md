@@ -208,6 +208,185 @@ Runbook: [iOS connect](https://docs.openclaw.ai/platforms/ios).
 - Exposes Connect/Chat/Voice tabs plus Canvas, Camera, Screen capture, and Android device command families.
 - Runbook: [Android connect](https://docs.openclaw.ai/platforms/android).
 
+## Run on Google Cloud Run (this fork)
+
+> This is a fork add-on; not part of upstream OpenClaw.
+
+This fork ships everything needed to run the OpenClaw Gateway as a managed Cloud Run service. State is kept in a GCS bucket and rsynced in/out on container start/stop, so paired devices, conversation history, and configuration survive restarts and revisions.
+
+Files added by this fork:
+
+- [`Dockerfile.cloudrun`](./Dockerfile.cloudrun) — Cloud Run image (Node 22 + Bun + `gsutil`) built on top of the OpenClaw build.
+- [`scripts/cloudrun-entrypoint.sh`](./scripts/cloudrun-entrypoint.sh) — restores state from GCS, seeds the headless config (`controlUi.allowInsecureAuth=true` + `controlUi.allowedOrigins` from `OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS`), starts a 5-minute background sync, runs the gateway on `$PORT`, and does a final sync on `SIGTERM`.
+- [`cloudbuild.build.yaml`](./cloudbuild.build.yaml) — build + push only (use with the manual `gcloud run deploy` flow below).
+- [`cloudbuild.yaml`](./cloudbuild.yaml) — all-in-one CI pipeline (build → push → `gcloud run deploy`); used by the Terraform-managed Cloud Build trigger.
+- [`.gcloudignore`](./.gcloudignore) — keeps the source tarball small.
+- [`terraform/`](./terraform/) — full IaC (Cloud Run, Artifact Registry, GCS, Secret Manager, IAM, optional IAP, Cloud Build trigger). See [`terraform/README.md`](./terraform/README.md).
+
+### How it works
+
+```
+Cloud Build (Dockerfile.cloudrun)
+        │  build + push
+        ▼
+Artifact Registry (Docker repo)
+        │
+        ▼
+Cloud Run service ── 5 min sync ──► GCS bucket (gs://.../openclaw-data/)
+   │  port 8080                              ▲
+   │  /data/.openclaw  (state)               │ restore on cold start /
+   │  /data/workspace  (workspace)           │ final sync on SIGTERM
+   ▼
+Secret Manager: openclaw-gateway-token
+```
+
+The entrypoint:
+
+1. `gsutil rsync` from `gs://$GCS_BUCKET/openclaw-data/` into `/data/.openclaw` and `/data/workspace`.
+2. Writes a default `openclaw.json` with `gateway.controlUi.allowInsecureAuth: true` so the token in `OPENCLAW_GATEWAY_TOKEN` works without device pairing, and merges any URLs in `OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS` into `gateway.controlUi.allowedOrigins` (required for the browser-served Control UI on Cloud Run, since the gateway only auto-seeds `localhost`).
+3. Spawns a background loop that rsyncs back to GCS every `SYNC_INTERVAL` seconds (default `300`).
+4. Runs `node /app/dist/index.js gateway --allow-unconfigured --bind $GATEWAY_BIND --port $PORT`.
+5. On `SIGTERM` (Cloud Run shutdown) it kills the sync loop, runs one last `rsync`, then forwards the signal to the gateway.
+
+### Quick test deploy via `gcloud` (no Terraform)
+
+This is the path used to bring up `openclaw-test-gateway` in `claw-for-all-app` (`us-central1`). Replace `claw-for-all-app` and `us-central1` with your project / region. End-to-end runtime is dominated by `pnpm install` + `pnpm build` inside Cloud Build; budget ~15-20 min on `E2_HIGHCPU_8` for a clean build.
+
+```bash
+PROJECT_ID=claw-for-all-app
+REGION=us-central1
+REPO=docker                  # any existing Artifact Registry Docker repo
+SERVICE=openclaw-test-gateway
+IMAGE=$REGION-docker.pkg.dev/$PROJECT_ID/$REPO/openclaw
+
+gcloud config set project "$PROJECT_ID"
+
+# 1. One-time APIs (idempotent)
+gcloud services enable \
+  run.googleapis.com \
+  cloudbuild.googleapis.com \
+  artifactregistry.googleapis.com \
+  secretmanager.googleapis.com \
+  storage.googleapis.com
+
+# 2. Create the gateway token (HTTP auth on the Control UI / WebSocket)
+openssl rand -hex 32 \
+  | gcloud secrets create openclaw-gateway-token \
+      --replication-policy=automatic --data-file=-
+
+# 2b. Provider auth — at least one is required for chat to work. Pick one or
+#     more of: GEMINI_API_KEY (google), OPENAI_API_KEY, ANTHROPIC_API_KEY.
+echo -n "AIza..." \
+  | gcloud secrets create GEMINI_API_KEY \
+      --replication-policy=automatic --data-file=-
+
+# 3. Create a GCS bucket for persistent state
+gcloud storage buckets create "gs://${PROJECT_ID}-openclaw-data" \
+  --location="$REGION" --uniform-bucket-level-access
+
+# 4. Build + push the image (uses Dockerfile.cloudrun)
+gcloud builds submit \
+  --config=cloudbuild.build.yaml \
+  --substitutions=_REGION=$REGION,_REPOSITORY=$REPO,_IMAGE_NAME=openclaw
+
+# 5. Deploy with the secret + GCS bucket wired in
+#
+# OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS must include the public Cloud Run URL,
+# otherwise the browser-served Control UI WebSocket gets rejected with
+# `origin not allowed`. We deploy in two passes: first to learn the URL, then
+# to feed it back into the env var.
+gcloud run deploy "$SERVICE" \
+  --image="$IMAGE:latest" \
+  --region="$REGION" \
+  --platform=managed \
+  --port=8080 \
+  --cpu=1 --memory=2Gi \
+  --min-instances=1 --max-instances=1 \
+  --timeout=3600 \
+  --allow-unauthenticated \
+  --set-env-vars="^@^GCS_BUCKET=${PROJECT_ID}-openclaw-data@^GATEWAY_BIND=lan@^SYNC_INTERVAL=300@^NODE_OPTIONS=--max-old-space-size=1536@^OPENCLAW_AGENT_MODEL=google/gemini-3-flash" \
+  --set-secrets="OPENCLAW_GATEWAY_TOKEN=openclaw-gateway-token:latest,GEMINI_API_KEY=GEMINI_API_KEY:latest"
+
+URL=$(gcloud run services describe "$SERVICE" --region="$REGION" --format='value(status.url)')
+gcloud run services update "$SERVICE" --region="$REGION" \
+  --update-env-vars="OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS=${URL}"
+```
+
+> The `^@^` prefix tells `gcloud` to use `@` as the env-var separator instead of the default `,` — required because `OPENCLAW_AGENT_MODEL=google/gemini-3-flash` is fine, but if you ever pass multiple URLs to `OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS` (comma-separated) the default parser breaks.
+
+The deploying service account (default: `<PROJECT_NUMBER>-compute@developer.gserviceaccount.com`) needs `roles/storage.objectAdmin` on the bucket and `roles/secretmanager.secretAccessor` on `openclaw-gateway-token`. Grant once:
+
+```bash
+PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
+RUNTIME_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+
+gcloud storage buckets add-iam-policy-binding "gs://${PROJECT_ID}-openclaw-data" \
+  --member="serviceAccount:${RUNTIME_SA}" --role="roles/storage.objectAdmin"
+
+gcloud secrets add-iam-policy-binding openclaw-gateway-token \
+  --member="serviceAccount:${RUNTIME_SA}" --role="roles/secretmanager.secretAccessor"
+```
+
+### Open the gateway
+
+```bash
+URL=$(gcloud run services describe "$SERVICE" --region="$REGION" --format='value(status.url)')
+TOKEN=$(gcloud secrets versions access latest --secret=openclaw-gateway-token)
+echo "${URL}/?token=${TOKEN}"
+```
+
+Open the printed URL in a browser to reach the Control UI. Use the same `${URL}` and `${TOKEN}` for `openclaw devices pair-token` from any local CLI / mobile node.
+
+### Day-2 operations
+
+```bash
+# Tail logs
+gcloud run services logs read "$SERVICE" --region="$REGION" --limit=200
+
+# Roll a new image after editing source
+gcloud builds submit --config=cloudbuild.build.yaml \
+  --substitutions=_REGION=$REGION,_REPOSITORY=$REPO,_IMAGE_NAME=openclaw
+gcloud run services update "$SERVICE" --region="$REGION" --image="$IMAGE:latest"
+
+# Force-revision rollout without rebuilding (re-reads secret latest version, etc.)
+gcloud run services update "$SERVICE" --region="$REGION"
+
+# Inspect synced state
+gsutil ls -l "gs://${PROJECT_ID}-openclaw-data/openclaw-data/"
+```
+
+### Configuration knobs (env vars)
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `PORT` | `8080` | Cloud Run-injected listen port. The gateway binds to this directly. |
+| `GCS_BUCKET` | _unset_ | Bucket used by the entrypoint for restore + periodic sync. If unset, the service runs ephemerally. |
+| `SYNC_INTERVAL` | `300` | Seconds between background `gsutil rsync` calls. |
+| `RESTORE_WORKSPACE` | `true` | Set to `false` to skip restoring `/data/workspace` on cold start. |
+| `GATEWAY_BIND` | `lan` | Passed through to `openclaw gateway --bind`. |
+| `OPENCLAW_STATE_DIR` | `/data/.openclaw` | Persistent config dir (mounted from in-container disk, synced to GCS). |
+| `OPENCLAW_WORKSPACE_DIR` | `/data/workspace` | Workspace dir (synced to GCS, excluding `node_modules`, `*.lock`, `*.tmp`, `*.log`). |
+| `OPENCLAW_GATEWAY_TOKEN` | _from secret_ | Bearer token for the Control UI / WebSocket. Required because `controlUi.allowInsecureAuth: true` is set in the default config the entrypoint writes. |
+| `OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS` | _unset_ | Comma-separated URLs merged into `gateway.controlUi.allowedOrigins`. Set this to your Cloud Run service URL(s) — without it, the gateway only allows `http://localhost:8080` and the browser-served Control UI gets `code=1008 reason=origin not allowed` on the WebSocket upgrade. |
+| `OPENCLAW_AGENT_MODEL` | _unset_ | Pin `agent.model` (e.g. `google/gemini-3-flash`, `anthropic/claude-sonnet-4.6`, `openai/gpt-5.5`). Without it, the gateway uses its built-in default (`openai/gpt-5.5`) which freezes chat unless `OPENAI_API_KEY` is also set. |
+| `GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | _from secret_ | Provider auth, picked up natively by OpenClaw. **At least one provider key must be wired in for chat to work** — the gateway boots fine without it, but messages will hang on the first agent call. |
+
+### Notes / gotchas
+
+- **Single instance, sticky state.** Cloud Run can in theory scale, but the GCS sync is last-writer-wins and the gateway holds local locks. Keep `min-instances=max-instances=1` (or use Cloud Run jobs / a different runtime if you need horizontal scale).
+- **Cold starts.** First start with `min-instances=0` does a full GCS rsync; budget ~30-60 s on top of normal Cloud Run cold-start latency. Set `min-instances=1` for a personal always-on gateway.
+- **No interactive pairing.** The entrypoint sets `gateway.controlUi.allowInsecureAuth: true` so the token alone is enough — never expose the URL without rotating `openclaw-gateway-token` if it leaks.
+- **Memory.** `Dockerfile.cloudrun` defaults `NODE_OPTIONS=--max-old-space-size=1536` and the deploy uses `--memory=2Gi`. Bump both together if you load heavy skills.
+- **Production / IaC.** For repeatable environments (Artifact Registry, GCS, Secret Manager, IAM, optional IAP, Cloud Build trigger) use the Terraform stack in [`terraform/`](./terraform/) instead of the manual flow above.
+
+### Cleanup
+
+```bash
+gcloud run services delete "$SERVICE" --region="$REGION" --quiet
+gcloud secrets delete openclaw-gateway-token --quiet
+gcloud storage rm -r "gs://${PROJECT_ID}-openclaw-data"
+```
+
 ## From source (development)
 
 Prefer `pnpm` for builds from source. Bun is optional for running TypeScript directly.

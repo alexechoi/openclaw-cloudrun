@@ -115,8 +115,16 @@ trap shutdown_handler SIGTERM SIGINT
 mkdir -p "$OPENCLAW_STATE_DIR" "$OPENCLAW_WORKSPACE_DIR"
 
 # Ensure gateway config exists with headless-friendly defaults.
-# allowInsecureAuth lets token-only auth bypass device pairing, which is
-# required for Cloud Run where there's no interactive pairing flow.
+#
+# - allowInsecureAuth lets token-only auth bypass device pairing, which is
+#   required for Cloud Run where there's no interactive pairing flow.
+# - controlUi.allowedOrigins must include the public Cloud Run URL or any
+#   browser-served origin (the gateway otherwise rejects WS upgrades with
+#   `origin not allowed`). Sourced from OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS
+#   (comma-separated list) so the same image works behind any URL.
+# - agent.model can be pinned via OPENCLAW_AGENT_MODEL (e.g.
+#   "google/gemini-3-flash"). Without it the gateway falls back to its built-in
+#   default ("openai/gpt-5.5"), which only works if OPENAI_API_KEY is set.
 ensure_gateway_config() {
     local config_file="$OPENCLAW_STATE_DIR/openclaw.json"
 
@@ -132,26 +140,56 @@ ensure_gateway_config() {
   }
 }
 CFGEOF
-    else
-        # Config exists (possibly restored from GCS). Ensure allowInsecureAuth
-        # is set so token-only auth works without device pairing.
-        if command -v node >/dev/null 2>&1; then
-            node -e "
+    fi
+
+    if ! command -v node >/dev/null 2>&1; then
+        log "WARN: node not found, cannot patch gateway config"
+        return 0
+    fi
+
+    OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS="${OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS:-}" \
+    OPENCLAW_AGENT_MODEL="${OPENCLAW_AGENT_MODEL:-}" \
+        node -e "
 const fs = require('fs');
 const f = '$config_file';
 const c = JSON.parse(fs.readFileSync(f, 'utf8'));
 if (!c.gateway) c.gateway = {};
 if (!c.gateway.controlUi) c.gateway.controlUi = {};
+if (!c.agent) c.agent = {};
+
+let dirty = false;
+
 if (c.gateway.controlUi.allowInsecureAuth !== true) {
   c.gateway.controlUi.allowInsecureAuth = true;
+  dirty = true;
+  console.log('[entrypoint] Patched allowInsecureAuth=true');
+}
+
+const rawOrigins = process.env.OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS || '';
+const requestedOrigins = rawOrigins.split(',').map((s) => s.trim()).filter(Boolean);
+if (requestedOrigins.length > 0) {
+  const existing = Array.isArray(c.gateway.controlUi.allowedOrigins)
+    ? c.gateway.controlUi.allowedOrigins.filter((o) => typeof o === 'string')
+    : [];
+  const merged = Array.from(new Set([...existing, ...requestedOrigins]));
+  if (merged.length !== existing.length || merged.some((o, i) => o !== existing[i])) {
+    c.gateway.controlUi.allowedOrigins = merged;
+    dirty = true;
+    console.log('[entrypoint] Set controlUi.allowedOrigins=' + JSON.stringify(merged));
+  }
+}
+
+const requestedModel = (process.env.OPENCLAW_AGENT_MODEL || '').trim();
+if (requestedModel && c.agent.model !== requestedModel) {
+  c.agent.model = requestedModel;
+  dirty = true;
+  console.log('[entrypoint] Set agent.model=' + JSON.stringify(requestedModel));
+}
+
+if (dirty) {
   fs.writeFileSync(f, JSON.stringify(c, null, 2) + '\n');
-  console.log('[entrypoint] Patched allowInsecureAuth into existing config');
 }
 "
-        else
-            log "WARN: node not found, cannot patch existing config"
-        fi
-    fi
 }
 
 # Restore from GCS on startup

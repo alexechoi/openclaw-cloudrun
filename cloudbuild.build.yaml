@@ -1,0 +1,48 @@
+# Cloud Build pipeline (build + push only).
+#
+# Pair this with a separate `gcloud run deploy` so env vars + secrets are owned
+# by the deploy command (or by Terraform). Use `cloudbuild.yaml` when you want
+# the all-in-one CI pipeline (build → push → deploy with default Cloud Run
+# config). Both write to the same Artifact Registry tags.
+#
+# Substitutions (defaults below):
+# - _REGION:       GCP region (e.g. us-central1)
+# - _REPOSITORY:   Artifact Registry Docker repo name (must already exist)
+# - _IMAGE_NAME:   Image name within the repo (default: openclaw)
+
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:$BUILD_ID'
+      - '-t'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:latest'
+      - '-f'
+      - 'Dockerfile.cloudrun'
+      - '.'
+    id: 'build'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - '--all-tags'
+      - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}'
+    id: 'push'
+    waitFor:
+      - 'build'
+
+images:
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:$BUILD_ID'
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:latest'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: 'E2_HIGHCPU_8'
+
+timeout: '1800s'
+
+substitutions:
+  _REGION: 'us-central1'
+  _REPOSITORY: 'openclaw-images'
+  _IMAGE_NAME: 'openclaw'
