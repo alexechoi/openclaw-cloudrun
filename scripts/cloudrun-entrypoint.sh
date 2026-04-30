@@ -246,12 +246,28 @@ case "${1:-gateway}" in
         # Export environment variables for the gateway
         export HOME="${HOME:-/home/node}"
         export OPENCLAW_GATEWAY_BIND="$GATEWAY_BIND"
-        
+
+        # Resolve the openclaw CLI. Upstream image symlinks /usr/local/bin/openclaw
+        # to the bundled openclaw.mjs; fall back to absolute paths if the layout
+        # changes upstream.
+        if command -v openclaw >/dev/null 2>&1; then
+            OPENCLAW_BIN="openclaw"
+        elif [ -x /app/openclaw.mjs ]; then
+            OPENCLAW_BIN="/app/openclaw.mjs"
+        elif [ -x /app/dist/index.js ]; then
+            OPENCLAW_BIN="node /app/dist/index.js"
+        else
+            log "ERROR: cannot find openclaw CLI (checked PATH, /app/openclaw.mjs, /app/dist/index.js)"
+            exit 1
+        fi
+        log "Using openclaw bin: $OPENCLAW_BIN"
+
         # Run the gateway in background (not exec) so trap handlers remain active.
         # Using exec would replace the shell, discarding trap handlers and preventing
         # graceful shutdown with final GCS sync.
         # Note: We use ${@:2} to skip the first argument ("gateway") which was already matched
-        node /app/dist/index.js gateway \
+        # shellcheck disable=SC2086
+        $OPENCLAW_BIN gateway \
             --allow-unconfigured \
             --bind "$GATEWAY_BIND" \
             --port "$PORT" \

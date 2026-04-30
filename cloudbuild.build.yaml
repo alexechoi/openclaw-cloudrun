@@ -1,19 +1,22 @@
 # Cloud Build pipeline (build + push only).
 #
-# Pair this with a separate `gcloud run deploy` so env vars + secrets are owned
-# by the deploy command (or by Terraform). Use `cloudbuild.yaml` when you want
+# Pair with a separate `gcloud run deploy` so env vars + secrets are owned
+# by the deploy command (or by Terraform). Use cloudbuild.yaml when you want
 # the all-in-one CI pipeline (build → push → deploy with default Cloud Run
 # config). Both write to the same Artifact Registry tags.
 #
-# Substitutions (defaults below):
-# - _REGION:       GCP region (e.g. us-central1)
-# - _REPOSITORY:   Artifact Registry Docker repo name (must already exist)
-# - _IMAGE_NAME:   Image name within the repo (default: openclaw)
+# Substitutions:
+# - _REGION:            GCP region (e.g. us-central1)
+# - _REPOSITORY:        Artifact Registry Docker repo (must already exist)
+# - _IMAGE_NAME:        Image name within the repo (default: openclaw)
+# - _OPENCLAW_VERSION:  Upstream openclaw image tag (default: latest)
 
 steps:
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'build'
+      - '--build-arg'
+      - 'OPENCLAW_VERSION=${_OPENCLAW_VERSION}'
       - '-t'
       - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:$BUILD_ID'
       - '-t'
@@ -46,3 +49,4 @@ substitutions:
   _REGION: 'us-central1'
   _REPOSITORY: 'docker'
   _IMAGE_NAME: 'openclaw'
+  _OPENCLAW_VERSION: 'latest'

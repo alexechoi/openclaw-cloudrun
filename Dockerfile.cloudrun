@@ -1,80 +1,70 @@
-# OpenClaw Cloud Run Dockerfile
-# Extends the base Dockerfile with GCS sync capabilities for persistent storage
+# syntax=docker/dockerfile:1.7
+#
+# Cloud Run overlay for OpenClaw.
+#
+# This image is a thin overlay on the upstream openclaw runtime container. We
+# do *not* build openclaw from source here -- the base image is built and
+# published by upstream on every release at:
+#   ghcr.io/openclaw/openclaw:<version>
+#
+# All this Dockerfile adds on top is:
+#   1. The Google Cloud SDK (gsutil) so the entrypoint can rsync state to/from
+#      a GCS bucket on container start/stop. Without persistent storage, every
+#      Cloud Run cold start would lose channel pairings, sessions, etc.
+#   2. A /data state dir owned by the upstream "node" user, since Cloud Run's
+#      writable filesystem is ephemeral but mounted writable.
+#   3. The Cloud Run entrypoint shim that handles GCS rsync, config patching,
+#      and graceful shutdown.
+#
+# Build:
+#   docker build -f Dockerfile.cloudrun \
+#     --build-arg OPENCLAW_VERSION=2026.4.27 \
+#     -t openclaw-cloudrun .
+#
+# Defaults to :latest so Cloud Build picks up new openclaw releases without
+# any change here. Pin via --build-arg or cloudbuild substitutions when you
+# want a deterministic build.
 
-FROM node:22-bookworm
+ARG OPENCLAW_VERSION=latest
+FROM ghcr.io/openclaw/openclaw:${OPENCLAW_VERSION}
 
-# Install Bun (required for build scripts)
-RUN curl -fsSL https://bun.sh/install | bash
-ENV PATH="/root/.bun/bin:${PATH}"
+USER root
 
-RUN corepack enable
+# Install gsutil from the official Google Cloud APT repo. Pulls in python3
+# and the broader google-cloud-cli, which is what we want -- the alternative
+# (pip install gsutil) is unmaintained and brittle on slim base images.
+RUN set -eux \
+ && apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      apt-transport-https ca-certificates curl gnupg python3 \
+ && curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+      | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+      > /etc/apt/sources.list.d/google-cloud-sdk.list \
+ && apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      google-cloud-cli \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-# Install Google Cloud SDK for gsutil (GCS sync)
-# Using the lightweight approach with just gsutil
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        apt-transport-https \
-        ca-certificates \
-        gnupg \
-        curl \
-    && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list \
-    && curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends google-cloud-cli \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+# Persistent state dir, owned by the upstream "node" user (uid 1000). The
+# entrypoint rsyncs this to/from gs://$GCS_BUCKET/openclaw-data/.
+RUN install -d -m 0755 -o node -g node /data /data/.openclaw /data/workspace
 
-WORKDIR /app
-
-# Support for additional apt packages (e.g., for skills)
-ARG OPENCLAW_DOCKER_APT_PACKAGES=""
-RUN if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
-      apt-get update && \
-      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $OPENCLAW_DOCKER_APT_PACKAGES && \
-      apt-get clean && \
-      rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
-    fi
-
-# Copy package files first for better caching
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
-COPY ui/package.json ./ui/package.json
-COPY patches ./patches
-COPY scripts ./scripts
-
-RUN pnpm install --frozen-lockfile
-
-# Copy application code
-COPY . .
-
-# Build the application
-RUN OPENCLAW_A2UI_SKIP_MISSING=1 pnpm build
-# Force pnpm for UI build (Bun may fail on ARM/Synology architectures)
-ENV OPENCLAW_PREFER_PNPM=1
-RUN pnpm ui:build
-
-ENV NODE_ENV=production
-
-# Create data directory for persistent storage
-RUN mkdir -p /data/.openclaw /data/workspace
-
-# Copy Cloud Run startup script
 COPY scripts/cloudrun-entrypoint.sh /usr/local/bin/cloudrun-entrypoint.sh
 RUN chmod +x /usr/local/bin/cloudrun-entrypoint.sh
 
-# Allow non-root user to write to necessary directories
-RUN chown -R node:node /app /data
-
-# Cloud Run requires the container to listen on PORT (default 8080)
-# We'll use the entrypoint to handle port mapping
-ENV PORT=8080
-ENV OPENCLAW_STATE_DIR=/data/.openclaw
-ENV OPENCLAW_WORKSPACE_DIR=/data/workspace
-
-# Security hardening: Run as non-root user
 USER node
 
-# Use the Cloud Run entrypoint script
-ENTRYPOINT ["/usr/local/bin/cloudrun-entrypoint.sh"]
+# OPENCLAW_STATE_DIR is honored by the CLI (src/utils.ts) so the gateway
+# reads/writes config under /data/.openclaw -- the same path the entrypoint
+# rsyncs to GCS.
+ENV PORT=8080 \
+    GATEWAY_PORT=18789 \
+    GATEWAY_BIND=lan \
+    OPENCLAW_STATE_DIR=/data/.openclaw \
+    OPENCLAW_WORKSPACE_DIR=/data/workspace \
+    NODE_OPTIONS=--max-old-space-size=1536
 
-# Default command (can be overridden)
+ENTRYPOINT ["/usr/local/bin/cloudrun-entrypoint.sh"]
 CMD ["gateway"]
