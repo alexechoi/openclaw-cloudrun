@@ -217,7 +217,7 @@ This fork ships everything needed to run the OpenClaw Gateway as a managed Cloud
 Files added by this fork:
 
 - [`Dockerfile.cloudrun`](./Dockerfile.cloudrun) — Cloud Run image (Node 22 + Bun + `gsutil`) built on top of the OpenClaw build.
-- [`scripts/cloudrun-entrypoint.sh`](./scripts/cloudrun-entrypoint.sh) — restores state from GCS, seeds the headless config (`controlUi.allowInsecureAuth=true` + `controlUi.allowedOrigins` from `OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS`), starts a 5-minute background sync, runs the gateway on `$PORT`, and does a final sync on `SIGTERM`.
+- [`scripts/cloudrun-entrypoint.sh`](./scripts/cloudrun-entrypoint.sh) — restores state from GCS, seeds the headless config (`controlUi.allowInsecureAuth=true`, `controlUi.dangerouslyDisableDeviceAuth=true`, plus `controlUi.allowedOrigins` from `OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS` and `agents.defaults.model` from `OPENCLAW_AGENT_MODEL`), starts a 5-minute background sync, runs the gateway on `$PORT`, and does a final sync on `SIGTERM`.
 - [`cloudbuild.build.yaml`](./cloudbuild.build.yaml) — build + push only (use with the manual `gcloud run deploy` flow below).
 - [`cloudbuild.yaml`](./cloudbuild.yaml) — all-in-one CI pipeline (build → push → `gcloud run deploy`); used by the Terraform-managed Cloud Build trigger.
 - [`.gcloudignore`](./.gcloudignore) — keeps the source tarball small.
@@ -243,7 +243,10 @@ Secret Manager: openclaw-gateway-token
 The entrypoint:
 
 1. `gsutil rsync` from `gs://$GCS_BUCKET/openclaw-data/` into `/data/.openclaw` and `/data/workspace`.
-2. Writes a default `openclaw.json` with `gateway.controlUi.allowInsecureAuth: true` so the token in `OPENCLAW_GATEWAY_TOKEN` works without device pairing, and merges any URLs in `OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS` into `gateway.controlUi.allowedOrigins` (required for the browser-served Control UI on Cloud Run, since the gateway only auto-seeds `localhost`).
+2. Writes a default `openclaw.json` with two break-glass flags so the token in `OPENCLAW_GATEWAY_TOKEN` is sufficient for the Control UI:
+   - `gateway.controlUi.dangerouslyDisableDeviceAuth: true` — the *only* flag that actually skips device pairing for **remote** operator connections (operator role only; node-role registrations still require a device identity). This is required on Cloud Run because there is no local operator to approve a pairing request, and the gateway is behind a load balancer so connections are never classified as "local".
+   - `gateway.controlUi.allowInsecureAuth: true` — relaxes the secure-context check so the in-browser Control UI can connect without a `SubtleCrypto`-generated device key.
+   It also merges any URLs in `OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS` into `gateway.controlUi.allowedOrigins` (required for the browser-served Control UI on Cloud Run, since the gateway only auto-seeds `localhost`).
 3. Spawns a background loop that rsyncs back to GCS every `SYNC_INTERVAL` seconds (default `300`).
 4. Runs `node /app/dist/index.js gateway --allow-unconfigured --bind $GATEWAY_BIND --port $PORT`.
 5. On `SIGTERM` (Cloud Run shutdown) it kills the sync loop, runs one last `rsync`, then forwards the signal to the gateway.
@@ -366,16 +369,16 @@ gsutil ls -l "gs://${PROJECT_ID}-openclaw-data/openclaw-data/"
 | `GATEWAY_BIND` | `lan` | Passed through to `openclaw gateway --bind`. |
 | `OPENCLAW_STATE_DIR` | `/data/.openclaw` | Persistent config dir (mounted from in-container disk, synced to GCS). |
 | `OPENCLAW_WORKSPACE_DIR` | `/data/workspace` | Workspace dir (synced to GCS, excluding `node_modules`, `*.lock`, `*.tmp`, `*.log`). |
-| `OPENCLAW_GATEWAY_TOKEN` | _from secret_ | Bearer token for the Control UI / WebSocket. Required because `controlUi.allowInsecureAuth: true` is set in the default config the entrypoint writes. |
+| `OPENCLAW_GATEWAY_TOKEN` | _from secret_ | Bearer token for the Control UI / WebSocket. Required because the entrypoint sets `controlUi.allowInsecureAuth: true` and `controlUi.dangerouslyDisableDeviceAuth: true` — the token is the only thing standing between the open internet and your gateway, so generate it with `openssl rand -hex 32` and rotate if exposed. |
 | `OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS` | _unset_ | Comma-separated URLs merged into `gateway.controlUi.allowedOrigins`. Set this to your Cloud Run service URL(s) — without it, the gateway only allows `http://localhost:8080` and the browser-served Control UI gets `code=1008 reason=origin not allowed` on the WebSocket upgrade. |
-| `OPENCLAW_AGENT_MODEL` | _unset_ | Pin `agent.model` (e.g. `google/gemini-3-flash`, `anthropic/claude-sonnet-4.6`, `openai/gpt-5.5`). Without it, the gateway uses its built-in default (`openai/gpt-5.5`) which freezes chat unless `OPENAI_API_KEY` is also set. |
+| `OPENCLAW_AGENT_MODEL` | _unset_ | Pin `agents.defaults.model` (e.g. `google/gemini-3-flash`, `anthropic/claude-sonnet-4.6`, `openai/gpt-5.5`). Without it, the gateway uses its built-in default (`openai/gpt-5.5`) which freezes chat unless `OPENAI_API_KEY` is also set. |
 | `GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | _from secret_ | Provider auth, picked up natively by OpenClaw. **At least one provider key must be wired in for chat to work** — the gateway boots fine without it, but messages will hang on the first agent call. |
 
 ### Notes / gotchas
 
 - **Single instance, sticky state.** Cloud Run can in theory scale, but the GCS sync is last-writer-wins and the gateway holds local locks. Keep `min-instances=max-instances=1` (or use Cloud Run jobs / a different runtime if you need horizontal scale).
 - **Cold starts.** First start with `min-instances=0` does a full GCS rsync; budget ~30-60 s on top of normal Cloud Run cold-start latency. Set `min-instances=1` for a personal always-on gateway.
-- **No interactive pairing.** The entrypoint sets `gateway.controlUi.allowInsecureAuth: true` so the token alone is enough — never expose the URL without rotating `openclaw-gateway-token` if it leaks.
+- **No interactive pairing.** The entrypoint sets both `gateway.controlUi.allowInsecureAuth: true` and `gateway.controlUi.dangerouslyDisableDeviceAuth: true` so the token alone is sufficient (operator role only — node registrations still require device identity). `allowInsecureAuth` on its own is *not* enough on Cloud Run: it only loosens the secure-context check for connections the gateway considers local, and the load balancer means your browser never looks local. If you remove the `dangerouslyDisableDeviceAuth` flag, the Control UI will fail with `device pairing required (requestId: …)` on every connect because no operator UI exists in the container to approve the request. Treat the gateway URL + token as full root access, never expose it without a strong token, and rotate `openclaw-gateway-token` if it leaks.
 - **Memory.** `Dockerfile.cloudrun` defaults `NODE_OPTIONS=--max-old-space-size=1536` and the deploy uses `--memory=2Gi`. Bump both together if you load heavy skills.
 - **Production / IaC.** For repeatable environments (Artifact Registry, GCS, Secret Manager, IAM, optional IAP, Cloud Build trigger) use the Terraform stack in [`terraform/`](./terraform/) instead of the manual flow above.
 

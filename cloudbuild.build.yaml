@@ -44,5 +44,5 @@ timeout: '1800s'
 
 substitutions:
   _REGION: 'us-central1'
-  _REPOSITORY: 'openclaw-images'
+  _REPOSITORY: 'docker'
   _IMAGE_NAME: 'openclaw'

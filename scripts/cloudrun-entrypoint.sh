@@ -116,8 +116,16 @@ mkdir -p "$OPENCLAW_STATE_DIR" "$OPENCLAW_WORKSPACE_DIR"
 
 # Ensure gateway config exists with headless-friendly defaults.
 #
-# - allowInsecureAuth lets token-only auth bypass device pairing, which is
-#   required for Cloud Run where there's no interactive pairing flow.
+# Cloud Run is headless: there is no operator UI to approve pairing requests, and
+# the gateway sits behind a load balancer so connections are never treated as
+# local. We therefore have to opt out of device pairing entirely for the
+# Control UI -- token auth is still enforced.
+#
+# - controlUi.dangerouslyDisableDeviceAuth: true is the only flag that actually
+#   skips device pairing for *remote* operator connections (operator role only;
+#   node-role registrations still require a device identity). `allowInsecureAuth`
+#   alone does NOT do this -- it only loosens the secure-context check for
+#   connections the gateway considers local, which Cloud Run is not.
 # - controlUi.allowedOrigins must include the public Cloud Run URL or any
 #   browser-served origin (the gateway otherwise rejects WS upgrades with
 #   `origin not allowed`). Sourced from OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS
@@ -135,7 +143,8 @@ ensure_gateway_config() {
   "gateway": {
     "mode": "local",
     "controlUi": {
-      "allowInsecureAuth": true
+      "allowInsecureAuth": true,
+      "dangerouslyDisableDeviceAuth": true
     }
   }
 }
@@ -155,7 +164,6 @@ const f = '$config_file';
 const c = JSON.parse(fs.readFileSync(f, 'utf8'));
 if (!c.gateway) c.gateway = {};
 if (!c.gateway.controlUi) c.gateway.controlUi = {};
-if (!c.agent) c.agent = {};
 
 let dirty = false;
 
@@ -163,6 +171,12 @@ if (c.gateway.controlUi.allowInsecureAuth !== true) {
   c.gateway.controlUi.allowInsecureAuth = true;
   dirty = true;
   console.log('[entrypoint] Patched allowInsecureAuth=true');
+}
+
+if (c.gateway.controlUi.dangerouslyDisableDeviceAuth !== true) {
+  c.gateway.controlUi.dangerouslyDisableDeviceAuth = true;
+  dirty = true;
+  console.log('[entrypoint] Patched dangerouslyDisableDeviceAuth=true (headless break-glass)');
 }
 
 const rawOrigins = process.env.OPENCLAW_CONTROL_UI_ALLOWED_ORIGINS || '';
@@ -179,11 +193,24 @@ if (requestedOrigins.length > 0) {
   }
 }
 
+// agents.defaults.model is the correct path; old configs used 'agent.model'
+// which the current schema rejects with 'Unrecognized key: agent'.
 const requestedModel = (process.env.OPENCLAW_AGENT_MODEL || '').trim();
-if (requestedModel && c.agent.model !== requestedModel) {
-  c.agent.model = requestedModel;
+if (requestedModel) {
+  if (!c.agents) c.agents = {};
+  if (!c.agents.defaults) c.agents.defaults = {};
+  if (c.agents.defaults.model !== requestedModel) {
+    c.agents.defaults.model = requestedModel;
+    dirty = true;
+    console.log('[entrypoint] Set agents.defaults.model=' + JSON.stringify(requestedModel));
+  }
+}
+
+// Strip any legacy top-level 'agent' key written by older entrypoint versions.
+if (Object.prototype.hasOwnProperty.call(c, 'agent')) {
+  delete c.agent;
   dirty = true;
-  console.log('[entrypoint] Set agent.model=' + JSON.stringify(requestedModel));
+  console.log('[entrypoint] Removed legacy top-level \"agent\" key');
 }
 
 if (dirty) {
